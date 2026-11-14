@@ -129,7 +129,7 @@ static const GOptionEntry commandLineOptions[] =
     { "private", 'p', 0, G_OPTION_ARG_NONE, &privateMode, "Run in private browsing mode", nullptr },
     { "profile-dir", 0, 0, G_OPTION_ARG_FILENAME, &profileDirectory, "Custom profile directory to store session data", "DIR" },
     { "automation", 0, 0, G_OPTION_ARG_NONE, &automationMode, "Run in automation mode", nullptr },
-    { "exit-on-webprocess-failure", 0, 0, G_OPTION_ARG_NONE, &exitOnWebProcessFailure, "Exit with an error if the WebProcess crashes", nullptr },
+    { "exit-on-webprocess-failure", 0, 0, G_OPTION_ARG_NONE, &exitOnWebProcessFailure, "Exit with an error if the WebProcess crashes or hangs", nullptr },
     { "cookies-file", 'c', 0, G_OPTION_ARG_FILENAME, &cookiesFile, "Persistent cookie storage database file", "FILE" },
     { "cookies-policy", 0, 0, G_OPTION_ARG_STRING, &cookiesPolicy, "Cookies accept policy (always, never, no-third-party). Default: no-third-party", "POLICY" },
     { "proxy", 0, 0, G_OPTION_ARG_STRING, &proxy, "Set proxy", "PROXY" },
@@ -344,6 +344,51 @@ static void webProcessTerminated(WebKitWebView* webView, WebKitWebProcessTermina
     webkit_web_view_load_alternate_html(webView, html, uri, nullptr);
 }
 
+// WebKit only checks the responsiveness of a WebProcess with visible pages
+// when the UIProcess sends it input or a navigation, so a page that hangs on
+// its own would go unnoticed. Instead, periodically run an empty script and
+// treat the WebProcess as hung if it has not replied by the next check.
+static constexpr unsigned webProcessHangCheckIntervalSeconds = 10;
+static const char* webProcessHangCheckTimeoutKey = "minibrowser-web-process-hang-check-timeout";
+static const char* webProcessHangCheckPendingKey = "minibrowser-web-process-hang-check-pending";
+
+static void webProcessHangCheckFinished(GObject* object, GAsyncResult* result, gpointer)
+{
+    // Any reply, even an error, means that the WebProcess is not hung.
+    g_autoptr(JSCValue) value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, nullptr);
+    g_object_set_data(object, webProcessHangCheckPendingKey, nullptr);
+}
+
+static gboolean webProcessHangCheck(gpointer userData)
+{
+    auto* webView = WEBKIT_WEB_VIEW(userData);
+    if (!g_object_get_data(G_OBJECT(webView), webProcessHangCheckPendingKey)) {
+        g_object_set_data(G_OBJECT(webView), webProcessHangCheckPendingKey, GINT_TO_POINTER(TRUE));
+        webkit_web_view_evaluate_javascript(webView, "", -1, "MiniBrowserHangCheck", nullptr, nullptr, webProcessHangCheckFinished, nullptr);
+        return G_SOURCE_CONTINUE;
+    }
+
+    g_object_steal_data(G_OBJECT(webView), webProcessHangCheckTimeoutKey);
+    g_warning("WebProcess unresponsive for %u seconds, terminating it", webProcessHangCheckIntervalSeconds);
+    webkit_web_view_terminate_web_process(webView);
+    applicationExitStatus = EXIT_FAILURE;
+    g_application_quit(g_application_get_default());
+    return G_SOURCE_REMOVE;
+}
+
+static void connectWebProcessFailureHandlers(WebKitWebView* webView)
+{
+    g_signal_connect(webView, "web-process-terminated", G_CALLBACK(webProcessTerminated), nullptr);
+    if (!exitOnWebProcessFailure)
+        return;
+
+    // The timeout is removed when the web view is destroyed.
+    guint timeoutID = g_timeout_add_seconds(webProcessHangCheckIntervalSeconds, webProcessHangCheck, webView);
+    g_object_set_data_full(G_OBJECT(webView), webProcessHangCheckTimeoutKey, GUINT_TO_POINTER(timeoutID), [](gpointer timeoutID) {
+        g_source_remove(GPOINTER_TO_UINT(timeoutID));
+    });
+}
+
 #if defined(USE_LIBWPE) && USE_LIBWPE
 static std::unique_ptr<WPEToolingBackends::ViewBackend> createViewBackend(uint32_t width, uint32_t height)
 {
@@ -416,7 +461,7 @@ static WebKitWebView* createWebView(WebKitWebView* webView, WebKitNavigationActi
 
     g_signal_connect(newWebView, "create", G_CALLBACK(createWebView), user_data);
     g_signal_connect(newWebView, "close", G_CALLBACK(webViewClose), user_data);
-    g_signal_connect(newWebView, "web-process-terminated", G_CALLBACK(webProcessTerminated), nullptr);
+    connectWebProcessFailureHandlers(newWebView);
 
     g_hash_table_add(openViews, newWebView);
 
@@ -460,7 +505,7 @@ static WebKitWebView* createWebViewForAutomationCallback(WebKitAutomationSession
     auto* application = g_application_get_default();
     g_signal_connect(newWebView, "create", G_CALLBACK(createWebView), application);
     g_signal_connect(newWebView, "close", G_CALLBACK(webViewClose), application);
-    g_signal_connect(newWebView, "web-process-terminated", G_CALLBACK(webProcessTerminated), nullptr);
+    connectWebProcessFailureHandlers(newWebView);
     webkit_web_view_load_uri(newWebView, "about:blank");
 
     g_hash_table_add(openViews, newWebView);
@@ -740,7 +785,7 @@ static void activate(GApplication* application, gpointer)
     g_signal_connect(webView, "permission-request", G_CALLBACK(decidePermissionRequest), nullptr);
     g_signal_connect(webView, "create", G_CALLBACK(createWebView), application);
     g_signal_connect(webView, "close", G_CALLBACK(webViewClose), application);
-    g_signal_connect(webView, "web-process-terminated", G_CALLBACK(webProcessTerminated), nullptr);
+    connectWebProcessFailureHandlers(webView);
     g_hash_table_add(openViews, webView);
 
     WebKitColor color;
