@@ -32,4 +32,5 @@
 WPEView* wpeDisplayCreateView(WPEDisplay*);
 bool wpeDisplayCheckEGLExtension(WPEDisplay*, ASCIILiteral);
 void wpeDisplayTerminateEGL(WPEDisplay*);
+void wpeDisplayMonitorDesktopSettings(WPEDisplay*);
 WPEInputMethodContext* wpeDisplayCreateInputMethodContext(WPEDisplay*, WPEView*);

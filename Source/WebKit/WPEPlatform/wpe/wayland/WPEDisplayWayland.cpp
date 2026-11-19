@@ -490,6 +490,8 @@ static gboolean wpeDisplayWaylandSetup(WPEDisplayWayland* display, GError** erro
     if (!priv->drmDevice)
         priv->drmDevice = wpeDRMDeviceCreateForDevice(nullptr);
 
+    wpeDisplayMonitorDesktopSettings(WPE_DISPLAY(display));
+
     return TRUE;
 }
 

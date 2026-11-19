@@ -86,6 +86,9 @@ struct _WPEDisplayPrivate {
     GRefPtr<WPESettings> settings;
     WPEAvailableInputDevices availableInputDevices;
     GRefPtr<WPEDRMDevice> overridenDRMDevice;
+    GRefPtr<GCancellable> desktopSettingsCancellable;
+    GRefPtr<GDBusConnection> desktopSettingsConnection;
+    unsigned desktopSettingsChangedSignalID { 0 };
 };
 
 WEBKIT_DEFINE_ABSTRACT_TYPE(WPEDisplay, wpe_display, G_TYPE_OBJECT)
@@ -130,9 +133,12 @@ static void wpeDisplayConstructed(GObject* object)
     G_OBJECT_CLASS(wpe_display_parent_class)->constructed(object);
 }
 
+static void wpeDisplayStopMonitoringDesktopSettings(WPEDisplay*);
+
 static void wpeDisplayDispose(GObject* object)
 {
     wpeDisplayTerminateEGL(WPE_DISPLAY(object));
+    wpeDisplayStopMonitoringDesktopSettings(WPE_DISPLAY(object));
 
     G_OBJECT_CLASS(wpe_display_parent_class)->dispose(object);
 }
@@ -486,6 +492,130 @@ WPEClipboard* wpe_display_get_clipboard(WPEDisplay* display)
             priv->clipboard = adoptGRef(wpe_clipboard_new(display));
     }
     return priv->clipboard.get();
+}
+
+static constexpr auto desktopPortalBusName = "org.freedesktop.portal.Desktop";
+static constexpr auto desktopPortalObjectPath = "/org/freedesktop/portal/desktop";
+static constexpr auto desktopPortalSettingsInterface = "org.freedesktop.portal.Settings";
+static constexpr auto appearanceNamespace = "org.freedesktop.appearance";
+static constexpr auto colorSchemeKey = "color-scheme";
+
+static void wpeDisplaySetColorScheme(WPEDisplay* display, GVariant* value)
+{
+    // Settings.Read() returns the value wrapped in an additional variant.
+    GRefPtr<GVariant> colorScheme = value;
+    while (g_variant_is_of_type(colorScheme.get(), G_VARIANT_TYPE_VARIANT))
+        colorScheme = adoptGRef(g_variant_get_variant(colorScheme.get()));
+    if (!g_variant_is_of_type(colorScheme.get(), G_VARIANT_TYPE_UINT32))
+        return;
+
+    // 0: no preference, 1: prefer dark appearance, 2: prefer light appearance.
+    bool darkMode = g_variant_get_uint32(colorScheme.get()) == 1;
+    wpe_settings_set_boolean(wpe_display_get_settings(display), WPE_SETTING_DARK_MODE, darkMode, WPE_SETTINGS_SOURCE_PLATFORM, nullptr);
+}
+
+static void wpeDisplayDesktopSettingChanged(GDBusConnection*, const char*, const char*, const char*, const char*, GVariant* parameters, gpointer userData)
+{
+    const char* settingNamespace;
+    const char* key;
+    GRefPtr<GVariant> value;
+    g_variant_get(parameters, "(&s&s@v)", &settingNamespace, &key, &value.outPtr());
+    if (!g_strcmp0(settingNamespace, appearanceNamespace) && !g_strcmp0(key, colorSchemeKey))
+        wpeDisplaySetColorScheme(WPE_DISPLAY(userData), value.get());
+}
+
+static void wpeDisplayReadColorScheme(WPEDisplay*, const char* method, GAsyncReadyCallback);
+
+static GRefPtr<GVariant> wpeDisplayReadColorSchemeFinish(GObject* connection, GAsyncResult* result, GError** error)
+{
+    GRefPtr<GVariant> reply = adoptGRef(g_dbus_connection_call_finish(G_DBUS_CONNECTION(connection), result, error));
+    if (!reply)
+        return nullptr;
+
+    GRefPtr<GVariant> value;
+    g_variant_get(reply.get(), "(@v)", &value.outPtr());
+    return value;
+}
+
+static void wpeDisplayReadColorSchemeFinished(GObject* connection, GAsyncResult* result, gpointer userData)
+{
+    GUniqueOutPtr<GError> error;
+    auto value = wpeDisplayReadColorSchemeFinish(connection, result, &error.outPtr());
+    if (g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        return;
+
+    if (value)
+        wpeDisplaySetColorScheme(WPE_DISPLAY(userData), value.get());
+}
+
+static void wpeDisplayReadOneColorSchemeFinished(GObject* connection, GAsyncResult* result, gpointer userData)
+{
+    GUniqueOutPtr<GError> error;
+    auto value = wpeDisplayReadColorSchemeFinish(connection, result, &error.outPtr());
+    if (g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        return;
+
+    // Settings.ReadOne() was added in version 2 of the portal, fall back to the deprecated Settings.Read().
+    if (g_error_matches(error.get(), G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD)) {
+        wpeDisplayReadColorScheme(WPE_DISPLAY(userData), "Read", wpeDisplayReadColorSchemeFinished);
+        return;
+    }
+
+    if (value)
+        wpeDisplaySetColorScheme(WPE_DISPLAY(userData), value.get());
+}
+
+static void wpeDisplayReadColorScheme(WPEDisplay* display, const char* method, GAsyncReadyCallback callback)
+{
+    auto* priv = display->priv;
+    g_dbus_connection_call(priv->desktopSettingsConnection.get(), desktopPortalBusName, desktopPortalObjectPath, desktopPortalSettingsInterface, method,
+        g_variant_new("(ss)", appearanceNamespace, colorSchemeKey), G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, -1,
+        priv->desktopSettingsCancellable.get(), callback, display);
+}
+
+static void wpeDisplaySessionBusReady(GObject*, GAsyncResult* result, gpointer userData)
+{
+    GUniqueOutPtr<GError> error;
+    GRefPtr<GDBusConnection> connection = adoptGRef(g_bus_get_finish(result, &error.outPtr()));
+    if (!connection) {
+        if (!g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED))
+            g_debug("Failed to connect to the session bus to monitor desktop settings: %s", error->message);
+        return;
+    }
+
+    auto* display = WPE_DISPLAY(userData);
+    auto* priv = display->priv;
+    priv->desktopSettingsConnection = WTF::move(connection);
+    priv->desktopSettingsChangedSignalID = g_dbus_connection_signal_subscribe(priv->desktopSettingsConnection.get(), desktopPortalBusName,
+        desktopPortalSettingsInterface, "SettingChanged", desktopPortalObjectPath, appearanceNamespace, G_DBUS_SIGNAL_FLAGS_NONE,
+        wpeDisplayDesktopSettingChanged, display, nullptr);
+    wpeDisplayReadColorScheme(display, "ReadOne", wpeDisplayReadOneColorSchemeFinished);
+}
+
+// Follow the desktop settings exposed by the XDG desktop portal,
+// currently only the preferred color scheme, which is mapped to WPE_SETTING_DARK_MODE.
+// Values set with WPE_SETTINGS_SOURCE_APPLICATION take precedence.
+// Only platform implementations for displays that are part of a desktop session should call this.
+void wpeDisplayMonitorDesktopSettings(WPEDisplay* display)
+{
+    auto* priv = display->priv;
+    if (priv->desktopSettingsCancellable)
+        return;
+
+    priv->desktopSettingsCancellable = adoptGRef(g_cancellable_new());
+    g_bus_get(G_BUS_TYPE_SESSION, priv->desktopSettingsCancellable.get(), wpeDisplaySessionBusReady, display);
+}
+
+static void wpeDisplayStopMonitoringDesktopSettings(WPEDisplay* display)
+{
+    auto* priv = display->priv;
+    if (priv->desktopSettingsCancellable)
+        g_cancellable_cancel(priv->desktopSettingsCancellable.get());
+    if (priv->desktopSettingsChangedSignalID) {
+        g_dbus_connection_signal_unsubscribe(priv->desktopSettingsConnection.get(), priv->desktopSettingsChangedSignalID);
+        priv->desktopSettingsChangedSignalID = 0;
+    }
+    priv->desktopSettingsConnection = nullptr;
 }
 
 /**
