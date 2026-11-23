@@ -33,10 +33,18 @@
 #include "ScriptCallStackFactory.h"
 #include "TopExceptionScope.h"
 #include <wtf/Assertions.h>
+#include <wtf/StdLibExtras.h>
 #include <wtf/TZoneMallocInlines.h>
 #include <wtf/text/CString.h>
 #include <wtf/text/StringBuilder.h>
+#include <wtf/text/StringToIntegerConversion.h>
 #include <wtf/text/WTFString.h>
+
+#if ENABLE(JOURNALD_LOG)
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace Inspector;
 
@@ -191,6 +199,68 @@ static void appendMessagePrefix(StringBuilder& builder, MessageSource source, Me
         builder.append(' ', levelString);
 }
 
+#if ENABLE(JOURNALD_LOG)
+static int journalPriority(MessageLevel level)
+{
+    switch (level) {
+    case MessageLevel::Log:
+    case MessageLevel::Info:
+        return LOG_INFO;
+    case MessageLevel::Debug:
+        return LOG_DEBUG;
+    case MessageLevel::Warning:
+        return LOG_WARNING;
+    case MessageLevel::Error:
+        return LOG_ERR;
+    }
+    return LOG_INFO;
+}
+
+// Only use the native journal protocol when stderr is already connected to the journal, as systemd
+// does for services: messages then end up in the same place, but multi-line ones are kept as a single entry.
+static bool shouldLogConsoleMessagesToJournal()
+{
+    static const bool shouldLogToJournal = [] {
+        if (!WTFShouldLogToJournal())
+            return false;
+
+        // systemd sets JOURNAL_STREAM to "<device>:<inode>" of the journal stream connected to stdout or stderr.
+        auto journalStream = StringView::fromLatin1(getenv("JOURNAL_STREAM"));
+        size_t separator = journalStream.find(':');
+        if (separator == notFound)
+            return false;
+
+        auto device = parseInteger<uint64_t>(journalStream.left(separator));
+        auto inode = parseInteger<uint64_t>(journalStream.substring(separator + 1));
+        struct stat stderrStat;
+        if (!device || !inode || fstat(STDERR_FILENO, &stderrStat))
+            return false;
+
+        return static_cast<uint64_t>(stderrStat.st_dev) == *device && static_cast<uint64_t>(stderrStat.st_ino) == *inode;
+    }();
+
+    return shouldLogToJournal;
+}
+#endif
+
+static void logConsoleMessageToSystemConsole(MessageLevel level, const String& message, const String& url, unsigned lineNumber, unsigned columnNumber)
+{
+#if ENABLE(JOURNALD_LOG)
+    if (shouldLogConsoleMessagesToJournal()) {
+        SAFE_SD_JOURNAL_SEND("MESSAGE=%s", message.utf8(), "PRIORITY=%d", journalPriority(level),
+            "WEBKIT_SUBSYSTEM=" LOG_CHANNEL_WEBKIT_SUBSYSTEM, "WEBKIT_CHANNEL=Console",
+            "WEBKIT_CONSOLE_URL=%s", url.utf8(), "WEBKIT_CONSOLE_LINE=%u", lineNumber, "WEBKIT_CONSOLE_COLUMN=%u", columnNumber);
+        return;
+    }
+#else
+    UNUSED_PARAM(level);
+    UNUSED_PARAM(url);
+    UNUSED_PARAM(lineNumber);
+    UNUSED_PARAM(columnNumber);
+#endif
+    SAFE_WTFLOGALWAYS("%s", message.utf8());
+}
+
 void ConsoleClient::printConsoleMessage(MessageSource source, MessageType type, MessageLevel level, const String& message, const String& url, unsigned lineNumber, unsigned columnNumber)
 {
     StringBuilder builder;
@@ -203,7 +273,7 @@ void ConsoleClient::printConsoleMessage(MessageSource source, MessageType type, 
     appendMessagePrefix(builder, source, type, level);
     builder.append(' ', message);
 
-    SAFE_WTFLOGALWAYS("%s", builder.toString().utf8());
+    logConsoleMessageToSystemConsole(level, builder.toString(), url, lineNumber, columnNumber);
 }
 
 void ConsoleClient::printConsoleMessageWithArguments(MessageSource source, MessageType type, MessageLevel level, JSC::JSGlobalObject* globalObject, Ref<ScriptArguments>&& arguments)
@@ -229,11 +299,6 @@ void ConsoleClient::printConsoleMessageWithArguments(MessageSource source, Messa
         scope.clearException();
     }
 
-    if (builder.hasOverflowed())
-        WTFLogAlways("Console message exceeded maximum length.");
-    else
-        SAFE_WTFLOGALWAYS("%s", builder.toString().utf8());
-
     if (isTraceMessage) {
         for (size_t i = 0; i < callStack->size(); ++i) {
             const ScriptCallFrame& callFrame = callStack->at(i);
@@ -241,14 +306,18 @@ void ConsoleClient::printConsoleMessageWithArguments(MessageSource source, Messa
             if (functionName.isEmpty())
                 functionName = "(unknown)"_s;
 
-            StringBuilder callFrameBuilder;
-            callFrameBuilder.append(i, ": "_s, functionName, '(');
-            appendURLAndPosition(callFrameBuilder, callFrame.sourceURL(), callFrame.lineNumber(), callFrame.columnNumber());
-            callFrameBuilder.append(')');
-
-            SAFE_WTFLOGALWAYS("%s", callFrameBuilder.toString().utf8());
+            builder.append('\n', i, ": "_s, functionName, '(');
+            appendURLAndPosition(builder, callFrame.sourceURL(), callFrame.lineNumber(), callFrame.columnNumber());
+            builder.append(')');
         }
     }
+
+    if (builder.hasOverflowed()) {
+        WTFLogAlways("Console message exceeded maximum length.");
+        return;
+    }
+
+    logConsoleMessageToSystemConsole(level, builder.toString(), lastCaller.sourceURL(), lastCaller.lineNumber(), lastCaller.columnNumber());
 }
 
 void ConsoleClient::internalMessageWithTypeAndLevel(MessageType type, MessageLevel level, JSC::JSGlobalObject* globalObject, Ref<ScriptArguments>&& arguments, ArgumentRequirement argumentRequirement)
