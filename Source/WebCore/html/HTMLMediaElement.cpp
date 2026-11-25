@@ -1273,8 +1273,12 @@ void HTMLMediaElement::pauseAfterDetachedTask()
     // Don't pause during an in-flight seek: pause()'s spec-mandated 'timeupdate' would race
     // with the seek's own seeking/timeupdate/seeked events, and listeners attached to the
     // (now-detached) element by an active test still receive these events.
-    if (m_videoFullscreenMode != VideoFullscreenModePictureInPicture && m_networkState > NETWORK_EMPTY && !m_wasInterruptedForInvisibleAutoplay && !m_seeking)
+    if (m_videoFullscreenMode != VideoFullscreenModePictureInPicture && m_networkState > NETWORK_EMPTY && !m_wasInterruptedForInvisibleAutoplay && !m_seeking) {
         pause();
+        // The internal pause steps set the can autoplay flag to false, but pauseInternal() returns early
+        // while the media session is interrupted, e.g. because the page is hidden.
+        m_autoplaying = false;
+    }
     if (m_videoFullscreenMode == VideoFullscreenModeStandard && !protect(document())->quirks().needsNowPlayingFullscreenSwapQuirk())
         exitFullscreen();
 
@@ -7492,8 +7496,10 @@ bool HTMLMediaElement::virtualHasPendingActivity() const
         if (mediaSession->state() != PlatformMediaSession::State::Interrupted)
             return false;
 
+        // An element that can no longer autoplay, e.g. because it was removed from the document,
+        // will not start playing when the interruption ends.
         auto stateToRestore = mediaSession->stateToRestore();
-        return stateToRestore == PlatformMediaSession::State::Autoplaying
+        return (stateToRestore == PlatformMediaSession::State::Autoplaying && m_autoplaying)
             || stateToRestore == PlatformMediaSession::State::Playing;
     }();
 
