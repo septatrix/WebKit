@@ -4933,6 +4933,10 @@ void HTMLMediaElement::pauseInternal(bool dispatchPauseEvent)
         return;
     }
 
+    // The internal pause steps first set the can autoplay flag to false. This must also happen while
+    // the media session is interrupted, which only records the pause as the state to restore.
+    m_autoplaying = false;
+
     Ref mediaSession = this->mediaSession();
     if (!mediaSession->clientWillPausePlayback()) {
         ALWAYS_LOG(LOGIDENTIFIER, "returning because of interruption");
@@ -4947,8 +4951,6 @@ void HTMLMediaElement::pauseInternal(bool dispatchPauseEvent)
             return;
         selectMediaResource();
     }
-
-    m_autoplaying = false;
 
     if (processingUserGestureForMedia())
         userDidInterfereWithAutoplay();
@@ -7492,8 +7494,10 @@ bool HTMLMediaElement::virtualHasPendingActivity() const
         if (mediaSession->state() != PlatformMediaSession::State::Interrupted)
             return false;
 
+        // An element that can no longer autoplay, e.g. because it was removed from the document,
+        // will not start playing when the interruption ends.
         auto stateToRestore = mediaSession->stateToRestore();
-        return stateToRestore == PlatformMediaSession::State::Autoplaying
+        return (stateToRestore == PlatformMediaSession::State::Autoplaying && m_autoplaying)
             || stateToRestore == PlatformMediaSession::State::Playing;
     }();
 
